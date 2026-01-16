@@ -19,36 +19,25 @@ BLUE, CYAN, GREEN, YELLOW, RED = (
 
 # --- Diff and confirmation ---
 
-def select(options):
-    """Arrow-key selection menu. Returns selected index."""
+def confirm():
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    idx = 0
     try:
         tty.setraw(fd)
+        sys.stdout.write(f"{DIM}[Enter] accept · [d] decline{RESET} ")
+        sys.stdout.flush()
         while True:
-            sys.stdout.write(f"\r\033[K")
-            for i, opt in enumerate(options):
-                sel = f"{BOLD}{GREEN}● {opt}{RESET}  " if i == idx else f"{DIM}○ {opt}{RESET}  "
-                sys.stdout.write(sel)
-            sys.stdout.flush()
             ch = sys.stdin.read(1)
             if ch in ("\r", "\n"):
-                break
-            if ch == "\x1b":
-                seq = sys.stdin.read(2)
-                if seq in ("[A", "[D"):
-                    idx = (idx - 1) % len(options)
-                elif seq in ("[B", "[C"):
-                    idx = (idx + 1) % len(options)
+                return True
+            if ch in ("d", "D"):
+                return False
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         print()
-    return idx
 
 
 def confirm_change(path, old_content, new_content):
-    """Show diff and ask user to accept/decline."""
     old_lines = old_content.splitlines(keepends=True) if old_content else []
     new_lines = new_content.splitlines(keepends=True) if new_content else []
     diff = list(difflib.unified_diff(old_lines, new_lines, n=3))
@@ -72,10 +61,14 @@ def confirm_change(path, old_content, new_content):
             print(f"{DIM}{old_ln:>6}   {txt}{RESET}"); old_ln += 1; new_ln += 1
     print(bar)
 
-    if select(["Yes", "No"]) == 0:
+    if confirm():
+        print(f"{GREEN}✓ Accepted{RESET}")
         return None
-    reason = input(f"{DIM}Reason (optional):{RESET} ").strip()
-    return f"declined: {reason}" if reason else "declined"
+    reason = input(f"{DIM}Reason (optional):{RESET} ").strip() or "stop and wait for further instructions"
+    status = {"New": "file NOT created", "Edit": "file NOT modified", "Delete": "file NOT deleted"}[action]
+    msg = f"declined ({status}): {reason}"
+    print(f"{RED}✗ {msg}{RESET}")
+    return msg
 
 # --- Tool implementations ---
 
@@ -94,7 +87,8 @@ def write(args):
         old_content = open(path).read()
     except FileNotFoundError:
         old_content = ""
-    if result := confirm_change(path, old_content, new_content):
+    result = confirm_change(path, old_content, new_content)
+    if result:  # declined
         return result
     with open(path, "w") as f:
         f.write(new_content)
@@ -111,7 +105,8 @@ def edit(args):
     if not args.get("all") and count > 1:
         return f"error: old_string appears {count} times, must be unique (use all=true)"
     new_content = old_content.replace(old, new) if args.get("all") else old_content.replace(old, new, 1)
-    if result := confirm_change(path, old_content, new_content):
+    result = confirm_change(path, old_content, new_content)
+    if result:  # declined
         return result
     with open(path, "w") as f:
         f.write(new_content)
@@ -267,7 +262,7 @@ def render_markdown(text):
 def main():
     print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}\n")
     messages = []
-    system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
+    system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}. When a file change is declined, respect the user's feedback and adjust accordingly. Do not retry the same change."
 
     while True:
         try:
@@ -290,6 +285,7 @@ def main():
                 response = call_api(messages, system_prompt)
                 content_blocks = response.get("content", [])
                 tool_results = []
+                declined = False
 
                 for block in content_blocks:
                     if block["type"] == "text":
@@ -304,6 +300,8 @@ def main():
                         )
 
                         result = run_tool(tool_name, tool_args)
+                        if "stop and wait" in result:
+                            declined = True
                         result_lines = result.split("\n")
                         preview = result_lines[0][:60]
                         if len(result_lines) > 1:
@@ -321,10 +319,10 @@ def main():
                         )
 
                 messages.append({"role": "assistant", "content": content_blocks})
-
-                if not tool_results:
+                if tool_results:
+                    messages.append({"role": "user", "content": tool_results})
+                if not tool_results or declined:
                     break
-                messages.append({"role": "user", "content": tool_results})
 
             print()
 
